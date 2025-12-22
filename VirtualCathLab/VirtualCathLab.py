@@ -620,6 +620,9 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
 
   SOFT_EDGE_MM_PARAMETER = "SoftEdgeMm"
 
+  # Spin patient around IS axis (degrees)
+  PATIENT_SPIN_PARAMETER = "patientSpin"
+
   # Device class detector size parameters
   FRONTAL_DETECTOR_HEIGHT_MM_PARAMETER = "GenericFluoro_frontalDetectorHeightMm"
   FRONTAL_DETECTOR_WIDTH_MM_PARAMETER = "GenericFluoro_frontalDetectorWidthMm"
@@ -754,6 +757,8 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
       parameterNode.SetParameter(self.DETECTOR_PIXEL_SIZE_PARAMETER, str(self.DETECTOR_PIXEL_SIZE_DEFAULT_MM))
     if not parameterNode.GetParameter(self.SOFT_EDGE_MM_PARAMETER):
       parameterNode.SetParameter(self.SOFT_EDGE_MM_PARAMETER, str(0.0))
+    if not parameterNode.GetParameter(self.PATIENT_SPIN_PARAMETER):
+      parameterNode.SetParameter(self.PATIENT_SPIN_PARAMETER, str(0.0))
 
   def updateTableCenterPointObservers(self):
     """
@@ -813,8 +818,30 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
     gantryToRASTransformNode.SetMatrixTransformToParent(newGantryToRASTransform.GetMatrix())
 
     positioningTransform = self.parameterNode.GetNodeReference(self.POSITIONING_TRANSFORM_REFERENCE)
-    if positioningTransform:
-      positioningTransform.SetAndObserveTransformNodeID(gantryToRASTransformNode.GetID())
+
+    # Determine patient spin from the current device class parameters (e.g., GenericFluoro_patientSpin).
+    patientSpinDeg = 0.0
+    deviceClass = self.getDeviceClass()
+    if deviceClass and self.parameterNode:
+      patientSpinDeg = deviceClass.getParameterValuesFromNode(self.parameterNode).get('patientSpin', 0.0)
+    else:
+      try:
+        patientSpinDeg = float(self.parameterNode.GetParameter(self.PATIENT_SPIN_PARAMETER) or 0.0) if self.parameterNode else 0.0
+      except ValueError:
+        patientSpinDeg = 0.0
+
+    if positioningTransform is None:
+      positioningTransform = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", self.POSITIONING_TRANSFORM_REFERENCE)
+      self.parameterNode.SetNodeReferenceID(self.POSITIONING_TRANSFORM_REFERENCE, positioningTransform.GetID())
+
+    positioningTransform.SetAndObserveTransformNodeID(gantryToRASTransformNode.GetID())
+
+    # Update orientation (rotation only) based on patientSpin around IS (S-axis)
+    spinTransform = vtk.vtkTransform()
+    spinTransform.Identity()
+    # In Slicer RAS, S axis corresponds to Z; rotate around Z.
+    spinTransform.RotateZ(patientSpinDeg)
+    positioningTransform.SetMatrixTransformToParent(spinTransform.GetMatrix())
 
   def onTableCenterPointChanged(self, tableCenterPointNode, event=None):
     """
@@ -1202,16 +1229,6 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
         continue
 
       singletonTag = threeDViewNode.GetSingletonTag()
-      if singletonTag != self.C_ARM_FRONTAL_VIEW_NAME and singletonTag != self.C_ARM_LATERAL_VIEW_NAME:
-        # Only apply to C-arm views
-        continue
-
-      renderWindow = view.renderWindow()
-
-      mmToPixels = 1.0
-      widthMm = 500
-      heightMm = 500
-      volumeNode = None
       if singletonTag == self.C_ARM_FRONTAL_VIEW_NAME:
         widthMm = self.getFrontalDetectorWidthMm()
         heightMm = self.getFrontalDetectorHeightMm()
@@ -1222,14 +1239,17 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
         heightMm = self.getLateralDetectorHeightMm()
         volumeNode = self.getLateralCArmVolumeNode()
         mmToPixels = 1.0 / self.getDetectorPixelSizeMm()
+      else:
+        # Only apply to fluoro rendering views
+        continue
 
       if volumeNode is None:
-        return
+        raise RuntimeError(f"Unable to get C-arm volume node for view {singletonTag}")
 
       widthPx = int(widthMm * mmToPixels)
       heightPx = int(heightMm * mmToPixels)
 
-      oldSize = widget.size
+      renderWindow = view.renderWindow()
       widget.resize(widthPx, heightPx)
       renderWindow.SetSize(widthPx, heightPx)
       renderWindow.Render()
@@ -1254,6 +1274,17 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
         # widget.resize(oldSize)
         slicer.util.arrayFromVolumeModified(volumeNode)
 
+        volumeNode.SetAttribute("VirtualCathLab.WidthMm", str(widthMm))
+        volumeNode.SetAttribute("VirtualCathLab.HeightMm", str(heightMm))
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(threeDViewNode)
+        volumeNode.SetAttribute("VirtualCathLab.SourceToImageDistance", cameraNode.GetAttribute("VirtualCathLab.SourceToImageDistance"))
+        position = cameraNode.GetCamera().GetPosition()
+        volumeNode.SetAttribute("VirtualCathLab.CameraPosition", f"{position[0]} {position[1]} {position[2]}")
+        focalPoint = cameraNode.GetCamera().GetFocalPoint()
+        volumeNode.SetAttribute("VirtualCathLab.CameraFocalPoint", f"{focalPoint[0]} {focalPoint[1]} {focalPoint[2]}")
+        viewUp = cameraNode.GetCamera().GetViewUp()
+        volumeNode.SetAttribute("VirtualCathLab.CameraViewUp", f"{viewUp[0]} {viewUp[1]} {viewUp[2]}")
+
         with slicer.util.RenderBlocker():
           self.updateImageSpacing(threeDViewNode)
 
@@ -1269,33 +1300,21 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
       if deviceClass.ID != BiplaneFluoro.ID:
         # The view may still be in the layout, but the device is not biplane
         return
-      detectorHeightMm = self.getLateralDetectorHeightMm()
       detectorVolumeNode = self.getLateralCArmVolumeNode()
       cameraTransform = self.parameterNode.GetNodeReference(self.LATERAL_CAMERA_TRANSFORM_REFERENCE)
-      sidMm = deviceParams['lateralArmSourceToImageDistance']
-      sodMm = deviceParams['lateralArmSourceToObjectDistance']
     else:
-      detectorHeightMm = self.getFrontalDetectorHeightMm()
       detectorVolumeNode = self.getFrontalCArmVolumeNode()
       cameraTransform = self.parameterNode.GetNodeReference(self.FRONTAL_CAMERA_TRANSFORM_REFERENCE)
-      sidMm = deviceParams['frontalArmSourceToImageDistance']
-      sodMm = deviceParams['frontalArmSourceToObjectDistance']
 
-    scaleFactor = sodMm / sidMm
-    imageHeight = detectorHeightMm * scaleFactor
-    mmToPixels = 1.0 / self.getDetectorPixelSizeMm()
     pixelsToMM = self.getDetectorPixelSizeMm()
 
     detectorToWorld = vtk.vtkGeneralTransform()
     slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(cameraTransform, None, detectorToWorld)
-    position_Detector = [0.0, 0.0, 0.0]
-    cameraPosition_RAS = np.array(detectorToWorld.TransformPoint(position_Detector))
 
     viewDirection_Detector = [0.0, 1.0, 0.0] # Look towards +Y direction of camera transform
     cameraViewDirection_RAS = np.array(detectorToWorld.TransformVectorAtPoint([0.0, 0.0, 0.0], viewDirection_Detector))
     cameraViewDirection_RAS = cameraViewDirection_RAS / np.linalg.norm(cameraViewDirection_RAS)
     kAxis_RAS = -cameraViewDirection_RAS
-    tableCenterPoint_RAS = cameraPosition_RAS + cameraViewDirection_RAS * sodMm
 
     viewUp_Detector = [0.0, 0.0, 1.0] # View up faces towards +Z direction of camera transform
     jAxis_RAS = np.array(detectorToWorld.TransformVectorAtPoint([0.0, 0.0, 0.0], viewUp_Detector))
@@ -1304,48 +1323,33 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
     iAxis_RAS = np.cross(jAxis_RAS, kAxis_RAS)
     iAxis_RAS = iAxis_RAS / np.linalg.norm(iAxis_RAS)
 
-    ijkToRASDirectionMatrix = vtk.vtkMatrix4x4()
-    for i in range(3):
-      ijkToRASDirectionMatrix.SetElement(i, 0, iAxis_RAS[i])
-      ijkToRASDirectionMatrix.SetElement(i, 1, jAxis_RAS[i])
-      ijkToRASDirectionMatrix.SetElement(i, 2, kAxis_RAS[i])
-    detectorVolumeNode.SetIJKToRASDirectionMatrix(ijkToRASDirectionMatrix)
-
-    oldSpacing = detectorVolumeNode.GetSpacing()
+    # Spacing & orientation (matches how fluoro images appear when loaded from DICOM)
+    ijkToRASMatrix = vtk.vtkMatrix4x4()
     newSpacing = [pixelsToMM, pixelsToMM, 1.0]
-    detectorVolumeNode.SetSpacing(newSpacing)
-    dimensions = detectorVolumeNode.GetImageData().GetDimensions()
-
-    originRAS = tableCenterPoint_RAS
-    originRAS -= 0.5 * dimensions[0] * newSpacing[0] * iAxis_RAS
-    originRAS -= 0.5 * dimensions[1] * newSpacing[1] * jAxis_RAS
-    detectorVolumeNode.SetOrigin(originRAS)
+    ijkToRASMatrix.SetElement(0, 0, -newSpacing[0])
+    ijkToRASMatrix.SetElement(1, 1, -newSpacing[1])
+    ijkToRASMatrix.SetElement(2, 2,  newSpacing[2])
+    detectorVolumeNode.SetIJKToRASMatrix(ijkToRASMatrix)
 
     layoutManager = slicer.app.layoutManager()
     sliceWidget = layoutManager.sliceWidget(f"{threeDViewNode.GetSingletonTag()}Slice")
     sliceNode = sliceWidget.mrmlSliceNode()
 
-    resliceInitialized = bool(sliceNode.GetAttribute("VirtualCathLab.ResliceInitialized"))
-
     volumeResliceDriverLogic = slicer.modules.volumereslicedriver.logic()
 
+    resliceInitialized = bool(sliceNode.GetAttribute("VirtualCathLab.ResliceInitialized"))
     if not resliceInitialized:
       sliceNode.RemoveAllThreeDViewIDs()
       sliceNode.AddThreeDViewID("vtkMRMLViewNode1")
       sliceNode.SetAttribute("VirtualCathLab.ResliceInitialized", "true")
       volumeResliceDriverLogic.SetDriverForSlice(detectorVolumeNode.GetID(), sliceNode)
       volumeResliceDriverLogic.SetModeForSlice(volumeResliceDriverLogic.MODE_TRANSVERSE, sliceNode)
+      # Fit slice to view
+      sliceWidget.sliceController().fitSliceToBackground()
 
     if singletonTag == self.C_ARM_LATERAL_VIEW_NAME:
       # If camera is looking towards -Z direction, flip the view direction to +Z
       volumeResliceDriverLogic.SetFlipForSlice(jAxis_RAS[2] < 0.0, sliceNode)
-
-    oldFov = sliceNode.GetFieldOfView()
-    newFov = [0,0,1.0]
-    for i in range(2):
-      fovScale = newSpacing[i] / oldSpacing[i]
-      newFov[i] = oldFov[i] * fovScale
-    sliceNode.SetFieldOfView(newFov[0], newFov[1], newFov[2])
 
     if not resliceInitialized:
       if singletonTag == self.C_ARM_FRONTAL_VIEW_NAME:
@@ -1556,7 +1560,11 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
       imageData.SetDimensions(1, 1, 1)
       imageData.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
       frontalVolumeNode.SetAndObserveImageData(imageData)
-      frontalVolumeNode.CreateDefaultDisplayNodes()
+      # Fluoro images are loaded with this orientation from DICOM
+      frontalVolumeNode.SetIJKToRASDirections(-1.0, 0.0, 0.0,
+                                               0.0, -1.0, 0.0,
+                                               0.0, 0.0, 1.0)
+      frontalVolumeNode.CreateDefaultDisplayNodes()      
       displayNode = frontalVolumeNode.GetDisplayNode()
       displayNode.AutoWindowLevelOff()
       displayNode.SetWindowLevelMinMax(0, 255)
@@ -1577,10 +1585,10 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
       imageData.SetDimensions(1, 1, 1)
       imageData.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
       lateralVolumeNode.SetAndObserveImageData(imageData)
-      lateralVolumeNode.CreateDefaultDisplayNodes()
       lateralVolumeNode.SetIJKToRASDirections(-1.0, 0.0, 0.0,
-                                               0.0, 1.0, 0.0,
+                                               0.0, -1.0, 0.0,
                                                0.0, 0.0, 1.0)
+      lateralVolumeNode.CreateDefaultDisplayNodes()
       displayNode = lateralVolumeNode.GetDisplayNode()
       displayNode.AutoWindowLevelOff()
       displayNode.SetWindowLevelMinMax(0, 255)
@@ -1594,6 +1602,9 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
     with slicer.util.NodeModify(cameraNode):
       cameraToWorld = vtk.vtkGeneralTransform()
       slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(cameraTransformNode, None, cameraToWorld)
+
+      cameraNode.SetAttribute("VirtualCathLab.SourceToImageDistance", str(sourceImageDistance))
+
       position_Camera = [0.0, 0.0, 0.0]
       cameraPosition_RAS = cameraToWorld.TransformPoint(position_Camera)
       cameraNode.SetPosition(cameraPosition_RAS)
