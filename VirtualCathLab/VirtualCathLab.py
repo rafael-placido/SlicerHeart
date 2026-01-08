@@ -450,6 +450,7 @@ class VirtualCathLabWidget(CardiacDeviceSimulatorWidget):
     Called each time the user opens this module.
     """
     super().enter()
+    slicer.app.layoutManager().connect('layoutChanged(int)', self.logic.onLayoutChanged)
     self.installDeviceControlShortcutKeys()
 
   def exit(self):
@@ -457,6 +458,7 @@ class VirtualCathLabWidget(CardiacDeviceSimulatorWidget):
     Called each time the user opens a different module.
     """
     super().exit()
+    slicer.app.layoutManager().disconnect('layoutChanged(int)', self.logic.onLayoutChanged)
     self.removeDeviceControlShortcutKeys()
 
 class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
@@ -635,8 +637,6 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
     # To connect parameter node changes to widget update function
     self.VirtualCathLabWidget = widgetInstance
 
-    layoutManager = slicer.app.layoutManager()
-    layoutManager.connect('layoutChanged(int)', self.onLayoutChanged)
     self.positionerAngleViewWidgets = {}
 
     self.renderTimer = qt.QTimer()
@@ -1259,33 +1259,38 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
 
       luminanceFilter = vtk.vtkImageLuminance()
       luminanceFilter.SetInputConnection(windowToImageFilter.GetOutputPort())
+      luminanceFilter.Update()
 
-      with slicer.util.NodeModify(volumeNode):
-        outputImageData = volumeNode.GetImageData()
-        if outputImageData is None:
-          outputImageData = vtk.vtkImageData()
-          volumeNode.SetAndObserveImageData(outputImageData)
+      # Flip the image vertically to match coordinate system in DICOM fluoro images,
+      # where the origin is at the top-left corner.
+      vflipImageFilter = vtk.vtkImageFlip()
+      vflipImageFilter.SetFilteredAxis(1) # flip Y axis
+      vflipImageFilter.SetInputData(luminanceFilter.GetOutput())
+      vflipImageFilter.Update()
 
-        filterOutput = luminanceFilter
-        filterOutput.SetOutput(outputImageData)
-        filterOutput.Update()
+      with slicer.util.RenderBlocker():
+        with slicer.util.NodeModify(volumeNode):
+          outputImageData = volumeNode.GetImageData()
+          if outputImageData is None:
+            outputImageData = vtk.vtkImageData()
+            volumeNode.SetAndObserveImageData(outputImageData)
 
-        # Disable, as constantly changing the render window size might be slow
-        # widget.resize(oldSize)
-        slicer.util.arrayFromVolumeModified(volumeNode)
+          outputImageData.ShallowCopy(vflipImageFilter.GetOutput())
 
-        volumeNode.SetAttribute("VirtualCathLab.WidthMm", str(widthMm))
-        volumeNode.SetAttribute("VirtualCathLab.HeightMm", str(heightMm))
-        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(threeDViewNode)
-        volumeNode.SetAttribute("VirtualCathLab.SourceToImageDistance", cameraNode.GetAttribute("VirtualCathLab.SourceToImageDistance"))
-        position = cameraNode.GetCamera().GetPosition()
-        volumeNode.SetAttribute("VirtualCathLab.CameraPosition", f"{position[0]} {position[1]} {position[2]}")
-        focalPoint = cameraNode.GetCamera().GetFocalPoint()
-        volumeNode.SetAttribute("VirtualCathLab.CameraFocalPoint", f"{focalPoint[0]} {focalPoint[1]} {focalPoint[2]}")
-        viewUp = cameraNode.GetCamera().GetViewUp()
-        volumeNode.SetAttribute("VirtualCathLab.CameraViewUp", f"{viewUp[0]} {viewUp[1]} {viewUp[2]}")
+          # Disable, as constantly changing the render window size might be slow
+          # widget.resize(oldSize)
 
-        with slicer.util.RenderBlocker():
+          volumeNode.SetAttribute("VirtualCathLab.WidthMm", str(widthMm))
+          volumeNode.SetAttribute("VirtualCathLab.HeightMm", str(heightMm))
+          cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(threeDViewNode)
+          volumeNode.SetAttribute("VirtualCathLab.SourceToImageDistance", cameraNode.GetAttribute("VirtualCathLab.SourceToImageDistance"))
+          position = cameraNode.GetCamera().GetPosition()
+          volumeNode.SetAttribute("VirtualCathLab.CameraPosition", f"{position[0]} {position[1]} {position[2]}")
+          focalPoint = cameraNode.GetCamera().GetFocalPoint()
+          volumeNode.SetAttribute("VirtualCathLab.CameraFocalPoint", f"{focalPoint[0]} {focalPoint[1]} {focalPoint[2]}")
+          viewUp = cameraNode.GetCamera().GetViewUp()
+          volumeNode.SetAttribute("VirtualCathLab.CameraViewUp", f"{viewUp[0]} {viewUp[1]} {viewUp[2]}")
+
           self.updateImageSpacing(threeDViewNode)
 
   def updateImageSpacing(self, threeDViewNode):
@@ -1337,7 +1342,8 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
 
     volumeResliceDriverLogic = slicer.modules.volumereslicedriver.logic()
 
-    resliceInitialized = bool(sliceNode.GetAttribute("VirtualCathLab.ResliceInitialized"))
+    resliceInitialized = (sliceNode.GetAttribute("VirtualCathLab.ResliceInitialized") == "true")
+
     if not resliceInitialized:
       sliceNode.RemoveAllThreeDViewIDs()
       sliceNode.AddThreeDViewID("vtkMRMLViewNode1")
@@ -1347,14 +1353,11 @@ class VirtualCathLabLogic(CardiacDeviceSimulatorLogic):
       # Fit slice to view
       sliceWidget.sliceController().fitSliceToBackground()
 
-    if singletonTag == self.C_ARM_LATERAL_VIEW_NAME:
-      # If camera is looking towards -Z direction, flip the view direction to +Z
-      volumeResliceDriverLogic.SetFlipForSlice(jAxis_RAS[2] < 0.0, sliceNode)
-
     if not resliceInitialized:
       if singletonTag == self.C_ARM_FRONTAL_VIEW_NAME:
-        volumeResliceDriverLogic.SetFlipForSlice(True, sliceNode)
         volumeResliceDriverLogic.SetRotationForSlice(-180, sliceNode)
+      elif singletonTag == self.C_ARM_LATERAL_VIEW_NAME:
+        volumeResliceDriverLogic.SetFlipForSlice(True, sliceNode)
 
   def resetSliceViews(self, fitSliceToVolume=True):
     """
