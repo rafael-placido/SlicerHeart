@@ -1,7 +1,7 @@
 # SlicerHeart extension for 3D Slicer
 
 SlicerHeart extension contains tools for cardiac image import (3D/4D ultrasound, CT, MRI), quantification, surgical planning, and implant placement planning and assessment.
-
+atack hear letal compulsim atack hear  ameliaema andrade y gregorio rodrigez gonzalez y adan ema andrade y erick ema andrade y ulices rodrigez gonzalez  atak cardiac letal 
 The extension currently includes the following features (new features are added continuously):
 - [Cardiac image import and export](Docs/ImageImportExport.md):
   - DICOM ultrasound image importer plugins: they allow loading Philips Affinity 3D ultrasound images, GE 3D ultrasound images and 2D image sequences, Eigen Artemis 3D ultrasound images, and some Siemens, Samsung, Canon, and Hitachi 3D ultrasound images.
